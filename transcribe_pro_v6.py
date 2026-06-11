@@ -1,5 +1,5 @@
-# transcribe_pro_v5_branch_04_branch_70.py
-# 版本號: v5_6_70_20250818
+# transcribe_pro_v6.py
+# 版本號: v6_0_00_20260611
 # 修改內容簡述:
 # 1. 【SRT校正強化】: 根據使用者回饋的11點校正規則，對 `parse_time_v10` 函式進行全面強化。
 # 2. 【規則 6 修正】: 新增正規表示式邏輯，能夠正確處理以冒號分隔毫秒的非標準時間格式 (例如 '00:00:190' -> '00:00,190')。
@@ -25,6 +25,7 @@
 # 17.【重構】因應多works導致的日誌不清，更改最後的SRT轉錄日誌(ai摘要)prompt以及在所有警告訊息前，加入了 `audio_filename` 變數，以明確指出是哪個音訊檔案的 SRT 塊出現問題。在 `run_transcription_task` 函式內的 `_job` 函式中，當任務產生例外時，在錯誤訊息中加入了 `os.path.basename(path)`，以顯示是哪個音訊區塊檔案導致了例外。
 # 18.【重構】parse_time_v10 函式中的毫秒補零規則修改為在前面補處理已更新為「補在百位數」的需求（例如 99 變成 099）。
 # 19.【Token 追蹤精確化】: 全面整合 API 回應的 usage_metadata，實現對每個區塊、AI 報告生成及最終任務的輸入、輸出與總 Token 數進行精確記錄與匯總。
+# 20.【輸出整理】: 新增 --output_dir，將 SRT 與報告輸出到指定目錄或來源檔同目錄，日誌固定寫入 logs/。
 import os
 import sys
 import subprocess
@@ -94,6 +95,20 @@ def get_application_path():
         return os.path.dirname(os.path.abspath(__file__))
 
 APP_PATH = get_application_path()
+
+def _make_client(config):
+    from google.genai import types as genai_types
+    api_key = (getattr(config, 'api_key', None) or
+               os.environ.get("GEMINI_API_KEY") or
+               os.environ.get("GOOGLE_API_KEY"))
+    base_url = getattr(config, 'custom_base_url', None)
+    if base_url:
+        return genai.Client(
+            api_key=api_key,
+            vertexai=True,
+            http_options=genai_types.HttpOptions(base_url=base_url, api_version='v1')
+        )
+    return genai.Client(api_key=api_key)
 
 def force_utf8_encoding():
     if sys.stdout.encoding != 'utf-8':
@@ -388,7 +403,8 @@ def format_srt_from_text_v16(srt_content, audio_filename, overlap_tolerance_td, 
 def transcribe_audio(client, audio_path, prompt_text, model_name,
                      correction_threshold, overlap_tolerance, chunk_duration,
                      truncation_threshold, ffmpeg_executable, is_last_chunk=False,
-                     max_retries=3, rate_limiter=None, retry_base=65, retry_cap=250):
+                     max_retries=3, rate_limiter=None, retry_base=65, retry_cap=250,
+                     use_inline=False):
     srt_path = os.path.splitext(audio_path)[0] + ".srt"
     file_basename = os.path.basename(audio_path)
     
@@ -399,14 +415,25 @@ def transcribe_audio(client, audio_path, prompt_text, model_name,
     overlap_tolerance_td = timedelta(seconds=overlap_tolerance)
 
     for attempt in range(max_retries):
+        uploaded_file = None
         try:
-            logging.info(f"[{file_basename} | 嘗試 {attempt+1}/{max_retries}] 正在上傳檔案...")
-            if rate_limiter: rate_limiter.wait()
-            uploaded_file = client.files.upload(file=audio_path)
+            if use_inline:
+                logging.info(f"[{file_basename} | 嘗試 {attempt+1}/{max_retries}] 正在以內聯音訊向模型 '{model_name}' 發送轉錄請求...")
+                with open(audio_path, 'rb') as fh:
+                    audio_bytes = fh.read()
+                from google.genai import types as genai_types
+                mime = 'audio/wav' if audio_path.lower().endswith('.wav') else 'audio/mpeg'
+                audio_part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime)
+                if rate_limiter: rate_limiter.wait()
+                response = client.models.generate_content(model=model_name, contents=[prompt_text, audio_part])
+            else:
+                logging.info(f"[{file_basename} | 嘗試 {attempt+1}/{max_retries}] 正在上傳檔案...")
+                if rate_limiter: rate_limiter.wait()
+                uploaded_file = client.files.upload(file=audio_path)
 
-            logging.info(f"檔案已上傳。正在向模型 '{model_name}' 發送轉錄請求...")
-            if rate_limiter: rate_limiter.wait()
-            response = client.models.generate_content(model=model_name, contents=[prompt_text, uploaded_file])
+                logging.info(f"檔案已上傳。正在向模型 '{model_name}' 發送轉錄請求...")
+                if rate_limiter: rate_limiter.wait()
+                response = client.models.generate_content(model=model_name, contents=[prompt_text, uploaded_file])
 
             # CHANGED: 獲取並記錄詳細的 token 用量
             if hasattr(response, 'usage_metadata') and response.usage_metadata:
@@ -556,6 +583,19 @@ def get_safe_path(base_path):
         if not os.path.exists(new_path): return new_path
         counter += 1
 
+def _ensure_logs_dir():
+    d = os.path.join(APP_PATH, "logs")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _resolve_output_dir(config):
+    od = getattr(config, 'output_dir', None)
+    if od:
+        os.makedirs(od, exist_ok=True)
+        return od
+    src = getattr(config, 'input_file', None)
+    return os.path.dirname(os.path.abspath(src)) if src else APP_PATH
+
 def merge_srts(srt_files, final_srt_path, chunk_duration_seconds):
     logging.info(f"[STATUS] 正在合併 {len(srt_files)} 個 SRT 檔案...")
     global_offset, entry_counter = timedelta(0), 1
@@ -588,8 +628,10 @@ def merge_srts(srt_files, final_srt_path, chunk_duration_seconds):
                 if i < len(sorted_srts) - 1: global_offset += chunk_duration_td
 
 # CHANGED: 整個函式已更新
-def create_transcription_report(log_filepath, client, model_name, log_queue=None):
-    report_filename = log_filepath.replace('_日誌_', '_SRT轉錄情況_')
+def create_transcription_report(log_filepath, client, model_name, log_queue=None, output_dir=None):
+    report_basename = os.path.basename(log_filepath).replace('_日誌_', '_SRT轉錄情況_')
+    report_dir = output_dir or os.path.dirname(log_filepath)
+    report_filename = os.path.join(report_dir, report_basename)
     logging.info("[STATUS] 正在生成 SRT轉錄情況報告...")
     if not client:
         logging.error("報告生成失敗：找不到 API 用戶端。")
@@ -669,7 +711,7 @@ def run_transcription_task(config, log_queue=None):
     try:
         file_basename = os.path.splitext(os.path.basename(config.input_file))[0]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filename = os.path.join(APP_PATH, f"{file_basename}_日誌_{timestamp}.txt")
+        log_filename = os.path.join(_ensure_logs_dir(), f"{file_basename}_日誌_{timestamp}.txt")
         setup_logging(log_filename, config.verbose, log_queue)
         logging.info("="*80 + f"\n開始執行任務: {datetime.now().strftime('%Y-%m-%d %H:%M%S')}\n版本: {os.path.basename(__file__)}\n處理檔案: {config.input_file}\n" + "="*80)
         os.makedirs(config.temp_dir, exist_ok=True)
@@ -694,14 +736,14 @@ def run_transcription_task(config, log_queue=None):
             if not all_chunk_srts:
                 logging.error(f"在 '{config.temp_dir}' 中找不到任何符合模式的 .srt 區塊檔案。")
                 raise SystemExit(1)
-            final_srt_path = get_safe_path(os.path.join(APP_PATH, f"{file_basename}.srt"))
+            output_dir = _resolve_output_dir(config)
+            final_srt_path = get_safe_path(os.path.join(output_dir, f"{file_basename}.srt"))
             merge_srts(all_chunk_srts, final_srt_path, config.chunk_duration)
             logging.info(f"僅合併模式完成。最終 SRT 檔案位於: {final_srt_path}")
             return 0
         client = None
         try:
-            api_key = config.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-            client = genai.Client(api_key=api_key)
+            client = _make_client(config)
             logging.info(f"成功建立 API 用戶端。將使用模型: {config.model_name}")
         except Exception as e:
             logging.error(f"建立 API 用戶端失敗: {e}")
@@ -742,6 +784,7 @@ def run_transcription_task(config, log_queue=None):
                             getattr(config, 'truncation_threshold', 60), config.ffmpeg_path, is_last_chunk=is_last,
                             max_retries=getattr(config, "max_retries", 3), rate_limiter=rate_limiter,
                             retry_base=getattr(config, "retry_base", 65), retry_cap=getattr(config, "retry_cap", 250),
+                            use_inline=bool(getattr(config, 'custom_base_url', None)),
                         )
                         _reset_empty_counter()
                         # CHANGED: 回傳詳細的 token 元組
@@ -782,12 +825,13 @@ def run_transcription_task(config, log_queue=None):
             if not valid_srts and transcription_was_performed:
                 logging.error("所有區塊轉錄均失敗或找不到有效的 SRT 檔案。任務中止。")
                 raise SystemExit(1)
-            final_srt_path = get_safe_path(os.path.join(APP_PATH, f"{file_basename}.srt"))
+            output_dir = _resolve_output_dir(config)
+            final_srt_path = get_safe_path(os.path.join(output_dir, f"{file_basename}.srt"))
             merge_srts(all_chunk_srts, final_srt_path, config.chunk_duration)
             logging.info(f"工作流程完成。最終 SRT 檔案位於: {final_srt_path}")
         if config.enable_report:
             if transcription_was_performed:
-                create_transcription_report(log_filename, client, config.model_name, log_queue)
+                create_transcription_report(log_filename, client, config.model_name, log_queue, output_dir=output_dir)
             else:
                 logging.info("沒有執行新的轉錄，跳過 SRT轉錄情況報告的生成。")
     except SystemExit as e:
@@ -815,7 +859,7 @@ def run_partial_transcription_task(config, log_queue=None):
     try:
         file_basename = os.path.splitext(os.path.basename(config.input_file))[0]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filename = os.path.join(APP_PATH, f"{file_basename}_日誌_partial_{timestamp}.txt")
+        log_filename = os.path.join(_ensure_logs_dir(), f"{file_basename}_日誌_partial_{timestamp}.txt")
         setup_logging(log_filename, config.verbose, log_queue)
         
         logging.info("="*80 + f"\n開始執行局部轉錄任務: {datetime.now().strftime('%Y-%m-%d %H:%M%S')}\n版本: {os.path.basename(__file__)}\n" + "="*80)
@@ -856,8 +900,7 @@ def run_partial_transcription_task(config, log_queue=None):
         # 建立 API 用戶端
         client = None
         try:
-            api_key = config.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-            client = genai.Client(api_key=api_key)
+            client = _make_client(config)
             logging.info(f"成功建立 API 用戶端，將使用模型: {config.model_name}")
         except Exception as e:
             logging.error(f"建立 API 用戶端失敗: {e}")
@@ -876,7 +919,8 @@ def run_partial_transcription_task(config, log_queue=None):
             truncation_threshold=0, # 局部轉錄不檢查結尾空白
             ffmpeg_executable=config.ffmpeg_path,
             is_last_chunk=True, # 視為單一的最後區塊
-            max_retries=config.max_retries if hasattr(config, 'max_retries') else 3
+            max_retries=config.max_retries if hasattr(config, 'max_retries') else 3,
+            use_inline=bool(getattr(config, 'custom_base_url', None))
         )
 
         if not partial_srt_path or not os.path.exists(partial_srt_path):
@@ -919,8 +963,9 @@ def run_partial_transcription_task(config, log_queue=None):
                 adjusted_content += entry + '\n\n'
 
         # 儲存校正後的 SRT 檔案
+        output_dir = _resolve_output_dir(config)
         final_srt_filename = f"{file_basename}_partial_{time_str_for_filename}.srt"
-        final_srt_path = get_safe_path(os.path.join(APP_PATH, final_srt_filename))
+        final_srt_path = get_safe_path(os.path.join(output_dir, final_srt_filename))
         
         with open(final_srt_path, 'w', encoding='utf-8') as f:
             f.write(adjusted_content)
@@ -945,10 +990,9 @@ def run_summarize_only_task(config, log_queue=None):
     try:
         setup_logging(config.log_file, config.verbose, log_queue)
         logging.info("【僅摘要模式】啟動...")
-        api_key = config.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        client = genai.Client(api_key=api_key)
+        client = _make_client(config)
         logging.info(f"成功建立 API 用戶端。將使用模型: {config.model_name}")
-        create_transcription_report(config.log_file, client, config.model_name, log_queue)
+        create_transcription_report(config.log_file, client, config.model_name, log_queue, output_dir=_resolve_output_dir(config))
         logging.info("僅摘要模式完成。")
     except Exception as e:
         exit_code = 1
@@ -965,7 +1009,9 @@ def main_cli():
     parser.add_argument("--file", dest="input_file", help="要處理的大型音訊或視訊檔案路徑。")
     parser.add_argument("--ffmpeg_path", help="FFmpeg 執行檔的完整路徑。")
     parser.add_argument("--temp_dir", default=os.path.join(APP_PATH, "temp"), help="儲存臨時音訊區塊和 SRT 檔案的目錄。")
+    parser.add_argument("--output_dir", default=None, help="SRT 與報告的輸出目錄，留空則輸出到輸入檔案同目錄。")
     parser.add_argument("--api_key", help="您的 API 金鑰。")
+    parser.add_argument("--custom_base_url", default=None, help="自訂中轉節點 base URL（vertex-ai 模式）。")
     parser.add_argument("--model_name", default="models/gemini-2.5-pro", help="要使用的 Gemini 模型名稱。")
     parser.add_argument("--prompt_file", help="包含主要指令的提示檔案路徑。")
     parser.add_argument("--verbose", action='store_true', help="啟用更詳細的日誌記錄。")

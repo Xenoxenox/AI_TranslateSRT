@@ -1,5 +1,5 @@
-# transcribe_pro_gui_v2_84.py
-# 版本號: v2.84_20250819
+# transcribe_pro_gui_v2_85.py
+# 版本號: v2.85_20260611
 # 修改內容簡述:
 # 1.  【佈局修正】: 徹底修復來源檔案路徑、狀態列文字過長時會遮擋右側按鈕的佈局問題。改用從右至左的 pack 佈局策略，確保按鈕位置固定。
 # 2.  【功能重構】: 新增一個獨立的 `CollapsibleFrame` 類別，專門處理區塊的收合/展開邏輯，取代之前不穩定的實作方式。
@@ -7,6 +7,7 @@
 # 4.  【路徑顯示】: 保留並驗證了固定規則的路徑縮略功能，確保長路徑能被正確顯示。
 # 5.  【完整性】: 此版本為包含所有函式與常數定義的完整版本，解決先前因省略程式碼導致的 Pylance 錯誤。
 # 6. 新增工具箱：快速知道這個時間點的原始音訊是來自哪個編號分割檔案的小計算機，預設自動代入下方分割時間段秒數，可手動修改
+# 7. 【輸出與退出修正】: 新增輸出目錄設定、即時狀態顯示，並強制子程序退出以避免報告生成後 GUI 卡死。
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox, simpledialog
 from tkinter import font as tkfont
@@ -32,16 +33,26 @@ def process_wrapper(target_func, config, log_queue):
     """
     執行目標函式，並使用其回傳值作為程序的退出碼。
     """
+    exit_code = 1
     try:
-        import sys
-        exit_code = target_func(config, log_queue)
-        sys.exit(exit_code if isinstance(exit_code, int) else 1)
+        result = target_func(config, log_queue)
+        exit_code = result if isinstance(result, int) else 1
     except SystemExit as e:
-        sys.exit(e.code)
+        exit_code = e.code if isinstance(e.code, int) else 1
     except Exception as e:
         if log_queue:
-            log_queue.put(f"FATAL ERROR in process_wrapper: {e}")
-        sys.exit(1)
+            try: log_queue.put(f"FATAL ERROR in process_wrapper: {e}")
+            except Exception: pass
+        exit_code = 1
+    finally:
+        # Queue 日誌先推回父進程，再強制退出，避免 API 客戶端殘留執行緒卡住 join()。
+        try:
+            if log_queue:
+                log_queue.close()
+                log_queue.join_thread()
+        except Exception:
+            pass
+        os._exit(exit_code)
 
 # ==============================================================================
 #  Reusable Collapsible Frame Class
@@ -581,44 +592,56 @@ class TranscriptionApp:
         for i in range(6): params_frame.columnconfigure(i, weight=1)
 
         self.api_key_var = tk.StringVar(); self.model_name_var = tk.StringVar(value="models/gemini-2.5-pro")
-        self.temp_dir_var = tk.StringVar(value=os.path.join(APP_PATH, "temp")); self.correction_threshold_var = tk.StringVar(value="6"); self.overlap_tolerance_var = tk.StringVar(value="0.5")
+        self.temp_dir_var = tk.StringVar(value=os.path.join(APP_PATH, "temp")); self.output_dir_var = tk.StringVar(); self.correction_threshold_var = tk.StringVar(value="6"); self.overlap_tolerance_var = tk.StringVar(value="0.5")
         self.truncation_threshold_var = tk.StringVar(value="60"); self.workers_var = tk.StringVar(value="1"); self.rpm_var = tk.StringVar(value="3")
         self.empty_abort_threshold_var = tk.StringVar(value="5"); self.enable_report_var = tk.BooleanVar(value=True); self.keep_prompt_var = tk.BooleanVar(value=False)
+        self.use_custom_endpoint_var = tk.BooleanVar(value=False); self.custom_base_url_var = tk.StringVar()
 
         ttk.Label(params_frame, text="API Key:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
         self.api_key_entry = ttk.Entry(params_frame, textvariable=self.api_key_var); self.api_key_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.api_key_entry, "可直接輸入 Gemini API 金鑰，或使用環境變數 GEMINI_API_KEY 或 GOOGLE_API_KEY")
         ttk.Label(params_frame, text="模型名稱:").grid(row=0, column=3, sticky="w", padx=5, pady=2)
         self.model_name_entry = ttk.Entry(params_frame, textvariable=self.model_name_var); self.model_name_entry.grid(row=0, column=4, columnspan=2, sticky="ew", padx=5, pady=2)
-        ttk.Label(params_frame, text="分段時長 (秒):").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        self.custom_endpoint_check = ttk.Checkbutton(params_frame, text="使用自訂端點", variable=self.use_custom_endpoint_var, command=self._on_custom_endpoint_toggle)
+        self.custom_endpoint_check.grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        self.base_url_entry = ttk.Entry(params_frame, textvariable=self.custom_base_url_var, state="disabled", width=40)
+        self.base_url_entry.grid(row=1, column=1, columnspan=5, sticky="ew", padx=5, pady=2)
+        CreateToolTip(self.base_url_entry, "中轉節點 Vertex AI 端點，例如：https://zenmux.ai/api/vertex-ai\n勾選後生效，留空則報錯。")
+        ttk.Label(params_frame, text="分段時長 (秒):").grid(row=2, column=0, sticky="w", padx=5, pady=2)
         
         # CHANGED: 連結到在 __init__ 中提前定義的 self.chunk_duration_var
-        self.chunk_duration_entry = ttk.Entry(params_frame, textvariable=self.chunk_duration_var); self.chunk_duration_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+        self.chunk_duration_entry = ttk.Entry(params_frame, textvariable=self.chunk_duration_var); self.chunk_duration_entry.grid(row=2, column=1, sticky="ew", padx=5, pady=2)
         
         CreateToolTip(self.chunk_duration_entry, "依此時長（秒）將影音檔分段，例如 600 秒會切成每段 600 秒。")
-        ttk.Label(params_frame, text="暫存資料夾:").grid(row=1, column=2, sticky="w", padx=5, pady=2)
-        self.temp_dir_entry = ttk.Entry(params_frame, textvariable=self.temp_dir_var); self.temp_dir_entry.grid(row=1, column=3, columnspan=3, sticky="ew", padx=5, pady=2)
-        ttk.Label(params_frame, text="修正閾值:").grid(row=2, column=0, sticky="w", padx=5, pady=2)
-        self.correction_threshold_entry = ttk.Entry(params_frame, textvariable=self.correction_threshold_var); self.correction_threshold_entry.grid(row=2, column=1, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="暫存資料夾:").grid(row=2, column=2, sticky="w", padx=5, pady=2)
+        self.temp_dir_entry = ttk.Entry(params_frame, textvariable=self.temp_dir_var); self.temp_dir_entry.grid(row=2, column=3, columnspan=3, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="輸出目錄:").grid(row=3, column=0, sticky="w", padx=5, pady=2)
+        self.output_dir_entry = ttk.Entry(params_frame, textvariable=self.output_dir_var)
+        self.output_dir_entry.grid(row=3, column=1, columnspan=4, sticky="ew", padx=5, pady=2)
+        self.output_dir_button = ttk.Button(params_frame, text="瀏覽...", command=self._select_output_dir)
+        self.output_dir_button.grid(row=3, column=5, sticky="ew", padx=5, pady=2)
+        CreateToolTip(self.output_dir_entry, "SRT 與 SRT轉錄情況報告的輸出目錄。\n留空 = 與輸入影音檔同目錄。")
+        ttk.Label(params_frame, text="修正閾值:").grid(row=4, column=0, sticky="w", padx=5, pady=2)
+        self.correction_threshold_entry = ttk.Entry(params_frame, textvariable=self.correction_threshold_var); self.correction_threshold_entry.grid(row=4, column=1, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.correction_threshold_entry, "觸發自動重跑的嚴重修正次數閾值。")
-        ttk.Label(params_frame, text="重疊容忍 (秒):").grid(row=2, column=2, sticky="w", padx=5, pady=2)
-        self.overlap_tolerance_entry = ttk.Entry(params_frame, textvariable=self.overlap_tolerance_var); self.overlap_tolerance_entry.grid(row=2, column=3, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="重疊容忍 (秒):").grid(row=4, column=2, sticky="w", padx=5, pady=2)
+        self.overlap_tolerance_entry = ttk.Entry(params_frame, textvariable=self.overlap_tolerance_var); self.overlap_tolerance_entry.grid(row=4, column=3, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.overlap_tolerance_entry, "允許的字幕時間軸重疊容忍秒數。\n設為負數 (例如 -1) 可完全關閉重疊偵測。")
-        ttk.Label(params_frame, text="結尾空白閾值 (秒):").grid(row=2, column=4, sticky="w", padx=5, pady=2)
-        self.truncation_threshold_entry = ttk.Entry(params_frame, textvariable=self.truncation_threshold_var); self.truncation_threshold_entry.grid(row=2, column=5, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="結尾空白閾值 (秒):").grid(row=4, column=4, sticky="w", padx=5, pady=2)
+        self.truncation_threshold_entry = ttk.Entry(params_frame, textvariable=self.truncation_threshold_var); self.truncation_threshold_entry.grid(row=4, column=5, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.truncation_threshold_entry, "偵測分割音檔在結尾是否出現長時間無字幕/靜音的異常，超過此秒數即判定為可疑截斷。\n設為 0 可停用此檢查。")
-        ttk.Label(params_frame, text="連續空值中止閾值:").grid(row=3, column=0, sticky="w", padx=5, pady=2)
-        self.empty_abort_threshold_entry = ttk.Entry(params_frame, textvariable=self.empty_abort_threshold_var); self.empty_abort_threshold_entry.grid(row=3, column=1, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="連續空值中止閾值:").grid(row=5, column=0, sticky="w", padx=5, pady=2)
+        self.empty_abort_threshold_entry = ttk.Entry(params_frame, textvariable=self.empty_abort_threshold_var); self.empty_abort_threshold_entry.grid(row=5, column=1, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.empty_abort_threshold_entry, "連續收到 API 空白回應(empty response)達到此次數，就自動中止任務。\n設為 0 可關閉此功能。")
-        ttk.Label(params_frame, text="併發數 (workers):").grid(row=3, column=2, sticky="w", padx=5, pady=2)
-        self.workers_entry = ttk.Entry(params_frame, textvariable=self.workers_var); self.workers_entry.grid(row=3, column=3, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="併發數 (workers):").grid(row=5, column=2, sticky="w", padx=5, pady=2)
+        self.workers_entry = ttk.Entry(params_frame, textvariable=self.workers_var); self.workers_entry.grid(row=5, column=3, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.workers_entry, "同時處理的轉錄任務數量，數字越大速度越快，但會增加電腦負載與 API 壓力。\n建議 2-4。")
-        ttk.Label(params_frame, text="每分鐘請求數 (rpm):").grid(row=3, column=4, sticky="w", padx=5, pady=2)
-        self.rpm_entry = ttk.Entry(params_frame, textvariable=self.rpm_var); self.rpm_entry.grid(row=3, column=5, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="每分鐘請求數 (rpm):").grid(row=5, column=4, sticky="w", padx=5, pady=2)
+        self.rpm_entry = ttk.Entry(params_frame, textvariable=self.rpm_var); self.rpm_entry.grid(row=5, column=5, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.rpm_entry, "限制每分鐘對 API 的總請求次數，用來避免觸發限流，數字越小越安全但速度會變慢，可根據官方該model頻率限制做調整。\n預設為 3。")
         
         check_frame = ttk.Frame(params_frame)
-        check_frame.grid(row=4, column=0, columnspan=6, sticky="w", padx=5, pady=2)
+        check_frame.grid(row=6, column=0, columnspan=6, sticky="w", padx=5, pady=2)
         self.report_check = ttk.Checkbutton(check_frame, text="啟用 SRT轉錄情況報告", variable=self.enable_report_var); self.report_check.pack(side=tk.LEFT, padx=(0, 10))
         self.keep_prompt_check = ttk.Checkbutton(check_frame, text="保留本次執行的 Prompt 檔案 (供偵錯用)", variable=self.keep_prompt_var); self.keep_prompt_check.pack(side=tk.LEFT)
         
@@ -659,6 +682,11 @@ class TranscriptionApp:
             display_path = self._get_display_path(f)
             self.file_path_var.set(display_path)
             self.status_var.set(f"已選檔案：{os.path.basename(f)}")
+
+    def _select_output_dir(self):
+        d = filedialog.askdirectory(title="選擇 SRT 與報告輸出目錄")
+        if d:
+            self.output_dir_var.set(os.path.normpath(d))
             
     def _validate_numeric_input(self, P):
         return P.isdigit() or P == ""
@@ -668,8 +696,10 @@ class TranscriptionApp:
             self.browse_button, self.language_entry, self.max_chars_entry, 
             self.add_term_button, self.edit_term_button, self.remove_term_button, 
             self.api_key_entry, self.model_name_entry, self.chunk_duration_entry, 
-            self.temp_dir_entry, self.correction_threshold_entry, self.overlap_tolerance_entry, 
+            self.temp_dir_entry, self.output_dir_entry, self.output_dir_button,
+            self.correction_threshold_entry, self.overlap_tolerance_entry,
             self.truncation_threshold_entry, self.workers_entry, self.rpm_entry, 
+            self.custom_endpoint_check, self.base_url_entry,
             self.report_check, self.keep_prompt_check, self.start_button, 
             self.merge_button, self.import_button, self.export_button, 
             self.main_rules_text, self.import_terms_button, self.export_terms_button,
@@ -682,6 +712,11 @@ class TranscriptionApp:
         ]
         for widget in widgets_to_toggle:
             try: widget.configure(state=state)
+            except tk.TclError: pass
+        if state == tk.NORMAL:
+            self._on_custom_endpoint_toggle()
+        else:
+            try: self.base_url_entry.configure(state=tk.DISABLED)
             except tk.TclError: pass
         
         for entry in self.start_time_entries.values():
@@ -711,9 +746,13 @@ class TranscriptionApp:
         # --- END NEW ---
 
     def _bind_settings_changes(self):
-        for var in [self.api_key_var, self.model_name_var, self.chunk_duration_var, self.temp_dir_var, self.correction_threshold_var, self.overlap_tolerance_var, self.truncation_threshold_var, self.language_var, self.max_chars_var, self.enable_report_var, self.keep_prompt_var, self.keep_partial_audio_var, self.workers_var, self.rpm_var, self.empty_abort_threshold_var]:
+        for var in [self.api_key_var, self.model_name_var, self.use_custom_endpoint_var, self.custom_base_url_var, self.chunk_duration_var, self.temp_dir_var, self.output_dir_var, self.correction_threshold_var, self.overlap_tolerance_var, self.truncation_threshold_var, self.language_var, self.max_chars_var, self.enable_report_var, self.keep_prompt_var, self.keep_partial_audio_var, self.workers_var, self.rpm_var, self.empty_abort_threshold_var]:
             var.trace_add("write", self._set_settings_changed)
         self.main_rules_text.bind("<<Modified>>", self._on_text_modified)
+
+    def _on_custom_endpoint_toggle(self):
+        state = "normal" if self.use_custom_endpoint_var.get() else "disabled"
+        self.base_url_entry.config(state=state)
 
     def _on_text_modified(self, event=None):
         if self.main_rules_text.edit_modified():
@@ -798,7 +837,11 @@ class TranscriptionApp:
     def _build_config_object(self, resume=False, recreate=False, merge_only=False, summarize_only=False, log_file=None):
         config = SimpleNamespace(); config.input_file = os.path.normpath(self.full_file_path) if self.full_file_path else None
         config.api_key = self.api_key_var.get(); config.model_name = self.model_name_var.get()
+        config.custom_base_url = (self.custom_base_url_var.get().strip()
+                                  if self.use_custom_endpoint_var.get() else None)
         config.chunk_duration = int(self.chunk_duration_var.get()); config.temp_dir = os.path.normpath(self.temp_dir_var.get())
+        output_dir = self.output_dir_var.get().strip()
+        config.output_dir = os.path.normpath(output_dir) if output_dir else None
         config.ffmpeg_path = os.path.normpath(self.ffmpeg_path); config.correction_threshold = int(self.correction_threshold_var.get())
         config.overlap_tolerance = float(self.overlap_tolerance_var.get()); config.truncation_threshold = int(self.truncation_threshold_var.get())
         config.workers = int(self.workers_var.get()); config.rpm = int(self.rpm_var.get())
@@ -872,6 +915,9 @@ class TranscriptionApp:
 
     def _start_transcription(self, merge_only=False, summarize_only=False, log_file_to_summarize=None):
         if self.is_running: messagebox.showinfo("執行中", "已有任務在執行。"); return
+        if self.use_custom_endpoint_var.get() and not self.custom_base_url_var.get().strip():
+            messagebox.showerror("配置錯誤", "已勾選「使用自訂端點」，但 Base URL 為空。")
+            return
         if not summarize_only and (not self.full_file_path or not os.path.exists(self.full_file_path)): messagebox.showinfo("未選擇檔案", "請先選擇影音檔案！"); return
         if not merge_only and not summarize_only and not self.language_var.get().strip(): messagebox.showinfo("缺少資訊", "請填寫要翻譯成的語言！"); return
         self.transcription_actually_performed = False; self.is_partial_task = False; self.last_exit_code = None
@@ -883,7 +929,7 @@ class TranscriptionApp:
         else:
             resume_action = "new_task" if merge_only else self._check_for_resume()
             if resume_action == "cancel": self.status_var.set("狀態: 操作已取消。"); return
-            self._set_ui_state(tk.DISABLED); self.is_running = True; self.status_var.set("狀態：執行中...請稍候...")
+            self._set_ui_state(tk.DISABLED); self.is_running = True; self.status_var.set("狀態：任務啟動中...")
             # 使用後端腳本的日誌格式
             # self.log(f"\n{'='*60}\n【{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}】開始新任務\n{'='*60}")
             config = self._build_config_object(resume=(resume_action == "resume"), recreate=(resume_action == "recreate"), merge_only=merge_only)
@@ -909,6 +955,7 @@ class TranscriptionApp:
             target_func = backend_task.run_summarize_only_task if is_summary_task else (backend_task.run_partial_transcription_task if is_partial_task else backend_task.run_transcription_task)
             self.process = multiprocessing.Process(target=process_wrapper, args=(target_func, config, self.log_queue))
             self.process.start()
+            self.status_var.set("狀態：任務啟動中...")
             threading.Thread(target=self._wait_for_process, daemon=True).start()
         except Exception as e:
             self.log(f"\n!!! 啟動背景任務失敗 !!!\n{e}\n"); self.is_running = False; self._set_ui_state(tk.NORMAL)
@@ -926,7 +973,10 @@ class TranscriptionApp:
                 item = self.log_queue.get_nowait()
                 if isinstance(item, str):
                     line = item.rstrip()
-                    if "INFO - 正在向模型" in line: self.transcription_actually_performed = True
+                    if "INFO -" in line and "發送轉錄請求" in line: self.transcription_actually_performed = True
+                    if "[STATUS]" in line:
+                        status_text = line.split("[STATUS]", 1)[1].strip()
+                        self.status_var.set(f"狀態：{status_text}")
                     if line.startswith("[RETRY_REPORT]"):
                         log_filepath = line.replace("[RETRY_REPORT]", "").strip()
                         self.is_running = False; self._set_ui_state(tk.NORMAL)
@@ -956,6 +1006,8 @@ class TranscriptionApp:
             with open(f, "r", encoding="utf-8") as jf: data = json.load(jf)
             self.main_rules_text.unbind("<<Modified>>")
             self.api_key_var.set(data.get("api_key", "")); self.model_name_var.set(data.get("model_name", "models/gemini-2.5-pro")); self.chunk_duration_var.set(data.get("chunk_duration", "600"))
+            self.use_custom_endpoint_var.set(data.get("use_custom_endpoint", False)); self.custom_base_url_var.set(data.get("custom_base_url", ""))
+            self.output_dir_var.set(data.get("output_dir", ""))
             self.temp_dir_var.set(data.get("temp_dir", os.path.join(APP_PATH, "temp"))); self.correction_threshold_var.set(data.get("correction_threshold", "5")); self.overlap_tolerance_var.set(data.get("overlap_tolerance", "0.5"))
             self.truncation_threshold_var.set(data.get("truncation_threshold", "60")); self.workers_var.set(data.get("workers", "1")); self.rpm_var.set(data.get("rpm", "3"))
             self.empty_abort_threshold_var.set(data.get("empty_abort_threshold", "5")); self.language_var.set(data.get("language", "繁體中文")); self.max_chars_var.set(data.get("max_chars", "15"))
@@ -972,12 +1024,36 @@ class TranscriptionApp:
         finally:
             self.main_rules_text.edit_modified(False); self.main_rules_text.bind("<<Modified>>", self._on_text_modified); self._ensure_parameter_entries_editable()
 
+    def _collect_settings_data(self):
+        terms = [list(self.terms_tree.item(child)["values"]) for child in self.terms_tree.get_children()]
+        return {
+            "api_key": self.api_key_var.get(),
+            "model_name": self.model_name_var.get(),
+            "use_custom_endpoint": self.use_custom_endpoint_var.get(),
+            "custom_base_url": self.custom_base_url_var.get(),
+            "chunk_duration": self.chunk_duration_var.get(),
+            "temp_dir": self.temp_dir_var.get(),
+            "output_dir": self.output_dir_var.get(),
+            "correction_threshold": self.correction_threshold_var.get(),
+            "overlap_tolerance": self.overlap_tolerance_var.get(),
+            "truncation_threshold": self.truncation_threshold_var.get(),
+            "workers": self.workers_var.get(),
+            "rpm": self.rpm_var.get(),
+            "empty_abort_threshold": self.empty_abort_threshold_var.get(),
+            "language": self.language_var.get(),
+            "max_chars": self.max_chars_var.get(),
+            "main_rules": self.main_rules_text.get("1.0", "end-1c").strip(),
+            "terms_list": terms,
+            "enable_report": self.enable_report_var.get(),
+            "keep_prompt_file": self.keep_prompt_var.get(),
+            "keep_partial_audio": self.keep_partial_audio_var.get()
+        }
+
     def _export_settings(self):
         f = filedialog.asksaveasfilename(title="匯出設定檔",defaultextension=".json", filetypes=[("JSON 檔", "*.json")])
         if not f: return
         try:
-            terms = [list(self.terms_tree.item(child)["values"]) for child in self.terms_tree.get_children()]
-            data = { "api_key": self.api_key_var.get(), "model_name": self.model_name_var.get(), "chunk_duration": self.chunk_duration_var.get(), "temp_dir": self.temp_dir_var.get(), "correction_threshold": self.correction_threshold_var.get(), "overlap_tolerance": self.overlap_tolerance_var.get(), "truncation_threshold": self.truncation_threshold_var.get(), "workers": self.workers_var.get(), "rpm": self.rpm_var.get(), "empty_abort_threshold": self.empty_abort_threshold_var.get(), "language": self.language_var.get(), "max_chars": self.max_chars_var.get(), "main_rules": self.main_rules_text.get("1.0", "end-1c").strip(), "terms_list": terms, "enable_report": self.enable_report_var.get(), "keep_prompt_file": self.keep_prompt_var.get(), "keep_partial_audio": self.keep_partial_audio_var.get() }
+            data = self._collect_settings_data()
             with open(f, "w", encoding="utf-8") as jf: json.dump(data, jf, indent=2, ensure_ascii=False)
             self.log(f"設定已匯出至：{f}")
         except Exception as e: messagebox.showerror("儲存失敗", f"寫入設定檔時發生錯誤：{e}")
@@ -1042,6 +1118,8 @@ class TranscriptionApp:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as jf: data = json.load(jf)
                 self.main_rules_text.unbind("<<Modified>>")
                 self.api_key_var.set(data.get("api_key", "")); self.model_name_var.set(data.get("model_name", "models/gemini-2.5-pro")); self.chunk_duration_var.set(data.get("chunk_duration", "600"))
+                self.use_custom_endpoint_var.set(data.get("use_custom_endpoint", False)); self.custom_base_url_var.set(data.get("custom_base_url", ""))
+                self.output_dir_var.set(data.get("output_dir", ""))
                 self.temp_dir_var.set(data.get("temp_dir", os.path.join(APP_PATH, "temp"))); self.correction_threshold_var.set(data.get("correction_threshold", "5")); self.overlap_tolerance_var.set(data.get("overlap_tolerance", "0.5"))
                 self.truncation_threshold_var.set(data.get("truncation_threshold", "60")); self.workers_var.set(data.get("workers", "1")); self.rpm_var.set(data.get("rpm", "3"))
                 self.empty_abort_threshold_var.set(data.get("empty_abort_threshold", "5")); self.language_var.set(data.get("language", "繁體中文")); self.max_chars_var.set(data.get("max_chars", "15"))
@@ -1078,8 +1156,7 @@ class TranscriptionApp:
             except Exception as e: self.log(f"終止背景任務時出錯: {e}")
         if self.settings_changed or save_only:
             try:
-                terms = [list(self.terms_tree.item(child)["values"]) for child in self.terms_tree.get_children()]
-                data = { "api_key": self.api_key_var.get(), "model_name": self.model_name_var.get(), "chunk_duration": self.chunk_duration_var.get(), "temp_dir": self.temp_dir_var.get(), "correction_threshold": self.correction_threshold_var.get(), "overlap_tolerance": self.overlap_tolerance_var.get(), "truncation_threshold": self.truncation_threshold_var.get(), "workers": self.workers_var.get(), "rpm": self.rpm_var.get(), "empty_abort_threshold": self.empty_abort_threshold_var.get(), "language": self.language_var.get(), "max_chars": self.max_chars_var.get(), "main_rules": self.main_rules_text.get("1.0", "end-1c").strip(), "terms_list": terms, "enable_report": self.enable_report_var.get(), "keep_prompt_file": self.keep_prompt_var.get(), "keep_partial_audio": self.keep_partial_audio_var.get() }
+                data = self._collect_settings_data()
                 with open(CONFIG_FILE, "w", encoding="utf-8") as jf: json.dump(data, jf, indent=2, ensure_ascii=False)
                 if ask_confirm: self.log(f"設定已變更，自動保存於 {CONFIG_FILE}")
             except Exception as e:
