@@ -1,5 +1,32 @@
-test/
+# OS/Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Env
 .env*
+
+# Virtual environments
 .venv/
+
+# Agents
 .claude/
 .firecrawl/
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Local
+test/
+temp/
+config.json
+logs/
+
+# Gitkeep
+!logs/.gitkeep
