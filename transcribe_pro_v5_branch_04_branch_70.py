@@ -95,6 +95,20 @@ def get_application_path():
 
 APP_PATH = get_application_path()
 
+def _make_client(config):
+    from google.genai import types as genai_types
+    api_key = (getattr(config, 'api_key', None) or
+               os.environ.get("GEMINI_API_KEY") or
+               os.environ.get("GOOGLE_API_KEY"))
+    base_url = getattr(config, 'custom_base_url', None)
+    if base_url:
+        return genai.Client(
+            api_key=api_key,
+            vertexai=True,
+            http_options=genai_types.HttpOptions(base_url=base_url, api_version='v1')
+        )
+    return genai.Client(api_key=api_key)
+
 def force_utf8_encoding():
     if sys.stdout.encoding != 'utf-8':
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -388,7 +402,8 @@ def format_srt_from_text_v16(srt_content, audio_filename, overlap_tolerance_td, 
 def transcribe_audio(client, audio_path, prompt_text, model_name,
                      correction_threshold, overlap_tolerance, chunk_duration,
                      truncation_threshold, ffmpeg_executable, is_last_chunk=False,
-                     max_retries=3, rate_limiter=None, retry_base=65, retry_cap=250):
+                     max_retries=3, rate_limiter=None, retry_base=65, retry_cap=250,
+                     use_inline=False):
     srt_path = os.path.splitext(audio_path)[0] + ".srt"
     file_basename = os.path.basename(audio_path)
     
@@ -399,14 +414,25 @@ def transcribe_audio(client, audio_path, prompt_text, model_name,
     overlap_tolerance_td = timedelta(seconds=overlap_tolerance)
 
     for attempt in range(max_retries):
+        uploaded_file = None
         try:
-            logging.info(f"[{file_basename} | 嘗試 {attempt+1}/{max_retries}] 正在上傳檔案...")
-            if rate_limiter: rate_limiter.wait()
-            uploaded_file = client.files.upload(file=audio_path)
+            if use_inline:
+                logging.info(f"[{file_basename} | 嘗試 {attempt+1}/{max_retries}] 正在以內聯音訊向模型 '{model_name}' 發送轉錄請求...")
+                with open(audio_path, 'rb') as fh:
+                    audio_bytes = fh.read()
+                from google.genai import types as genai_types
+                mime = 'audio/wav' if audio_path.lower().endswith('.wav') else 'audio/mpeg'
+                audio_part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime)
+                if rate_limiter: rate_limiter.wait()
+                response = client.models.generate_content(model=model_name, contents=[prompt_text, audio_part])
+            else:
+                logging.info(f"[{file_basename} | 嘗試 {attempt+1}/{max_retries}] 正在上傳檔案...")
+                if rate_limiter: rate_limiter.wait()
+                uploaded_file = client.files.upload(file=audio_path)
 
-            logging.info(f"檔案已上傳。正在向模型 '{model_name}' 發送轉錄請求...")
-            if rate_limiter: rate_limiter.wait()
-            response = client.models.generate_content(model=model_name, contents=[prompt_text, uploaded_file])
+                logging.info(f"檔案已上傳。正在向模型 '{model_name}' 發送轉錄請求...")
+                if rate_limiter: rate_limiter.wait()
+                response = client.models.generate_content(model=model_name, contents=[prompt_text, uploaded_file])
 
             # CHANGED: 獲取並記錄詳細的 token 用量
             if hasattr(response, 'usage_metadata') and response.usage_metadata:
@@ -700,8 +726,7 @@ def run_transcription_task(config, log_queue=None):
             return 0
         client = None
         try:
-            api_key = config.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-            client = genai.Client(api_key=api_key)
+            client = _make_client(config)
             logging.info(f"成功建立 API 用戶端。將使用模型: {config.model_name}")
         except Exception as e:
             logging.error(f"建立 API 用戶端失敗: {e}")
@@ -742,6 +767,7 @@ def run_transcription_task(config, log_queue=None):
                             getattr(config, 'truncation_threshold', 60), config.ffmpeg_path, is_last_chunk=is_last,
                             max_retries=getattr(config, "max_retries", 3), rate_limiter=rate_limiter,
                             retry_base=getattr(config, "retry_base", 65), retry_cap=getattr(config, "retry_cap", 250),
+                            use_inline=bool(getattr(config, 'custom_base_url', None)),
                         )
                         _reset_empty_counter()
                         # CHANGED: 回傳詳細的 token 元組
@@ -856,8 +882,7 @@ def run_partial_transcription_task(config, log_queue=None):
         # 建立 API 用戶端
         client = None
         try:
-            api_key = config.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-            client = genai.Client(api_key=api_key)
+            client = _make_client(config)
             logging.info(f"成功建立 API 用戶端，將使用模型: {config.model_name}")
         except Exception as e:
             logging.error(f"建立 API 用戶端失敗: {e}")
@@ -876,7 +901,8 @@ def run_partial_transcription_task(config, log_queue=None):
             truncation_threshold=0, # 局部轉錄不檢查結尾空白
             ffmpeg_executable=config.ffmpeg_path,
             is_last_chunk=True, # 視為單一的最後區塊
-            max_retries=config.max_retries if hasattr(config, 'max_retries') else 3
+            max_retries=config.max_retries if hasattr(config, 'max_retries') else 3,
+            use_inline=bool(getattr(config, 'custom_base_url', None))
         )
 
         if not partial_srt_path or not os.path.exists(partial_srt_path):
@@ -945,8 +971,7 @@ def run_summarize_only_task(config, log_queue=None):
     try:
         setup_logging(config.log_file, config.verbose, log_queue)
         logging.info("【僅摘要模式】啟動...")
-        api_key = config.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        client = genai.Client(api_key=api_key)
+        client = _make_client(config)
         logging.info(f"成功建立 API 用戶端。將使用模型: {config.model_name}")
         create_transcription_report(config.log_file, client, config.model_name, log_queue)
         logging.info("僅摘要模式完成。")
@@ -966,6 +991,7 @@ def main_cli():
     parser.add_argument("--ffmpeg_path", help="FFmpeg 執行檔的完整路徑。")
     parser.add_argument("--temp_dir", default=os.path.join(APP_PATH, "temp"), help="儲存臨時音訊區塊和 SRT 檔案的目錄。")
     parser.add_argument("--api_key", help="您的 API 金鑰。")
+    parser.add_argument("--custom_base_url", default=None, help="自訂中轉節點 base URL（vertex-ai 模式）。")
     parser.add_argument("--model_name", default="models/gemini-2.5-pro", help="要使用的 Gemini 模型名稱。")
     parser.add_argument("--prompt_file", help="包含主要指令的提示檔案路徑。")
     parser.add_argument("--verbose", action='store_true', help="啟用更詳細的日誌記錄。")
