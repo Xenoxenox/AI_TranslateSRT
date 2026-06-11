@@ -7,6 +7,7 @@
 # 4.  【路徑顯示】: 保留並驗證了固定規則的路徑縮略功能，確保長路徑能被正確顯示。
 # 5.  【完整性】: 此版本為包含所有函式與常數定義的完整版本，解決先前因省略程式碼導致的 Pylance 錯誤。
 # 6. 新增工具箱：快速知道這個時間點的原始音訊是來自哪個編號分割檔案的小計算機，預設自動代入下方分割時間段秒數，可手動修改
+# 7. 【輸出與退出修正】: 新增輸出目錄設定、即時狀態顯示，並強制子程序退出以避免報告生成後 GUI 卡死。
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox, simpledialog
 from tkinter import font as tkfont
@@ -32,16 +33,26 @@ def process_wrapper(target_func, config, log_queue):
     """
     執行目標函式，並使用其回傳值作為程序的退出碼。
     """
+    exit_code = 1
     try:
-        import sys
-        exit_code = target_func(config, log_queue)
-        sys.exit(exit_code if isinstance(exit_code, int) else 1)
+        result = target_func(config, log_queue)
+        exit_code = result if isinstance(result, int) else 1
     except SystemExit as e:
-        sys.exit(e.code)
+        exit_code = e.code if isinstance(e.code, int) else 1
     except Exception as e:
         if log_queue:
-            log_queue.put(f"FATAL ERROR in process_wrapper: {e}")
-        sys.exit(1)
+            try: log_queue.put(f"FATAL ERROR in process_wrapper: {e}")
+            except Exception: pass
+        exit_code = 1
+    finally:
+        # Queue 日誌先推回父進程，再強制退出，避免 API 客戶端殘留執行緒卡住 join()。
+        try:
+            if log_queue:
+                log_queue.close()
+                log_queue.join_thread()
+        except Exception:
+            pass
+        os._exit(exit_code)
 
 # ==============================================================================
 #  Reusable Collapsible Frame Class
@@ -581,7 +592,7 @@ class TranscriptionApp:
         for i in range(6): params_frame.columnconfigure(i, weight=1)
 
         self.api_key_var = tk.StringVar(); self.model_name_var = tk.StringVar(value="models/gemini-2.5-pro")
-        self.temp_dir_var = tk.StringVar(value=os.path.join(APP_PATH, "temp")); self.correction_threshold_var = tk.StringVar(value="6"); self.overlap_tolerance_var = tk.StringVar(value="0.5")
+        self.temp_dir_var = tk.StringVar(value=os.path.join(APP_PATH, "temp")); self.output_dir_var = tk.StringVar(); self.correction_threshold_var = tk.StringVar(value="6"); self.overlap_tolerance_var = tk.StringVar(value="0.5")
         self.truncation_threshold_var = tk.StringVar(value="60"); self.workers_var = tk.StringVar(value="1"); self.rpm_var = tk.StringVar(value="3")
         self.empty_abort_threshold_var = tk.StringVar(value="5"); self.enable_report_var = tk.BooleanVar(value=True); self.keep_prompt_var = tk.BooleanVar(value=False)
         self.use_custom_endpoint_var = tk.BooleanVar(value=False); self.custom_base_url_var = tk.StringVar()
@@ -604,27 +615,33 @@ class TranscriptionApp:
         CreateToolTip(self.chunk_duration_entry, "依此時長（秒）將影音檔分段，例如 600 秒會切成每段 600 秒。")
         ttk.Label(params_frame, text="暫存資料夾:").grid(row=2, column=2, sticky="w", padx=5, pady=2)
         self.temp_dir_entry = ttk.Entry(params_frame, textvariable=self.temp_dir_var); self.temp_dir_entry.grid(row=2, column=3, columnspan=3, sticky="ew", padx=5, pady=2)
-        ttk.Label(params_frame, text="修正閾值:").grid(row=3, column=0, sticky="w", padx=5, pady=2)
-        self.correction_threshold_entry = ttk.Entry(params_frame, textvariable=self.correction_threshold_var); self.correction_threshold_entry.grid(row=3, column=1, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="輸出目錄:").grid(row=3, column=0, sticky="w", padx=5, pady=2)
+        self.output_dir_entry = ttk.Entry(params_frame, textvariable=self.output_dir_var)
+        self.output_dir_entry.grid(row=3, column=1, columnspan=4, sticky="ew", padx=5, pady=2)
+        self.output_dir_button = ttk.Button(params_frame, text="瀏覽...", command=self._select_output_dir)
+        self.output_dir_button.grid(row=3, column=5, sticky="ew", padx=5, pady=2)
+        CreateToolTip(self.output_dir_entry, "SRT 與 SRT轉錄情況報告的輸出目錄。\n留空 = 與輸入影音檔同目錄。")
+        ttk.Label(params_frame, text="修正閾值:").grid(row=4, column=0, sticky="w", padx=5, pady=2)
+        self.correction_threshold_entry = ttk.Entry(params_frame, textvariable=self.correction_threshold_var); self.correction_threshold_entry.grid(row=4, column=1, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.correction_threshold_entry, "觸發自動重跑的嚴重修正次數閾值。")
-        ttk.Label(params_frame, text="重疊容忍 (秒):").grid(row=3, column=2, sticky="w", padx=5, pady=2)
-        self.overlap_tolerance_entry = ttk.Entry(params_frame, textvariable=self.overlap_tolerance_var); self.overlap_tolerance_entry.grid(row=3, column=3, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="重疊容忍 (秒):").grid(row=4, column=2, sticky="w", padx=5, pady=2)
+        self.overlap_tolerance_entry = ttk.Entry(params_frame, textvariable=self.overlap_tolerance_var); self.overlap_tolerance_entry.grid(row=4, column=3, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.overlap_tolerance_entry, "允許的字幕時間軸重疊容忍秒數。\n設為負數 (例如 -1) 可完全關閉重疊偵測。")
-        ttk.Label(params_frame, text="結尾空白閾值 (秒):").grid(row=3, column=4, sticky="w", padx=5, pady=2)
-        self.truncation_threshold_entry = ttk.Entry(params_frame, textvariable=self.truncation_threshold_var); self.truncation_threshold_entry.grid(row=3, column=5, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="結尾空白閾值 (秒):").grid(row=4, column=4, sticky="w", padx=5, pady=2)
+        self.truncation_threshold_entry = ttk.Entry(params_frame, textvariable=self.truncation_threshold_var); self.truncation_threshold_entry.grid(row=4, column=5, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.truncation_threshold_entry, "偵測分割音檔在結尾是否出現長時間無字幕/靜音的異常，超過此秒數即判定為可疑截斷。\n設為 0 可停用此檢查。")
-        ttk.Label(params_frame, text="連續空值中止閾值:").grid(row=4, column=0, sticky="w", padx=5, pady=2)
-        self.empty_abort_threshold_entry = ttk.Entry(params_frame, textvariable=self.empty_abort_threshold_var); self.empty_abort_threshold_entry.grid(row=4, column=1, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="連續空值中止閾值:").grid(row=5, column=0, sticky="w", padx=5, pady=2)
+        self.empty_abort_threshold_entry = ttk.Entry(params_frame, textvariable=self.empty_abort_threshold_var); self.empty_abort_threshold_entry.grid(row=5, column=1, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.empty_abort_threshold_entry, "連續收到 API 空白回應(empty response)達到此次數，就自動中止任務。\n設為 0 可關閉此功能。")
-        ttk.Label(params_frame, text="併發數 (workers):").grid(row=4, column=2, sticky="w", padx=5, pady=2)
-        self.workers_entry = ttk.Entry(params_frame, textvariable=self.workers_var); self.workers_entry.grid(row=4, column=3, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="併發數 (workers):").grid(row=5, column=2, sticky="w", padx=5, pady=2)
+        self.workers_entry = ttk.Entry(params_frame, textvariable=self.workers_var); self.workers_entry.grid(row=5, column=3, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.workers_entry, "同時處理的轉錄任務數量，數字越大速度越快，但會增加電腦負載與 API 壓力。\n建議 2-4。")
-        ttk.Label(params_frame, text="每分鐘請求數 (rpm):").grid(row=4, column=4, sticky="w", padx=5, pady=2)
-        self.rpm_entry = ttk.Entry(params_frame, textvariable=self.rpm_var); self.rpm_entry.grid(row=4, column=5, sticky="ew", padx=5, pady=2)
+        ttk.Label(params_frame, text="每分鐘請求數 (rpm):").grid(row=5, column=4, sticky="w", padx=5, pady=2)
+        self.rpm_entry = ttk.Entry(params_frame, textvariable=self.rpm_var); self.rpm_entry.grid(row=5, column=5, sticky="ew", padx=5, pady=2)
         CreateToolTip(self.rpm_entry, "限制每分鐘對 API 的總請求次數，用來避免觸發限流，數字越小越安全但速度會變慢，可根據官方該model頻率限制做調整。\n預設為 3。")
         
         check_frame = ttk.Frame(params_frame)
-        check_frame.grid(row=5, column=0, columnspan=6, sticky="w", padx=5, pady=2)
+        check_frame.grid(row=6, column=0, columnspan=6, sticky="w", padx=5, pady=2)
         self.report_check = ttk.Checkbutton(check_frame, text="啟用 SRT轉錄情況報告", variable=self.enable_report_var); self.report_check.pack(side=tk.LEFT, padx=(0, 10))
         self.keep_prompt_check = ttk.Checkbutton(check_frame, text="保留本次執行的 Prompt 檔案 (供偵錯用)", variable=self.keep_prompt_var); self.keep_prompt_check.pack(side=tk.LEFT)
         
@@ -665,6 +682,11 @@ class TranscriptionApp:
             display_path = self._get_display_path(f)
             self.file_path_var.set(display_path)
             self.status_var.set(f"已選檔案：{os.path.basename(f)}")
+
+    def _select_output_dir(self):
+        d = filedialog.askdirectory(title="選擇 SRT 與報告輸出目錄")
+        if d:
+            self.output_dir_var.set(os.path.normpath(d))
             
     def _validate_numeric_input(self, P):
         return P.isdigit() or P == ""
@@ -674,7 +696,8 @@ class TranscriptionApp:
             self.browse_button, self.language_entry, self.max_chars_entry, 
             self.add_term_button, self.edit_term_button, self.remove_term_button, 
             self.api_key_entry, self.model_name_entry, self.chunk_duration_entry, 
-            self.temp_dir_entry, self.correction_threshold_entry, self.overlap_tolerance_entry, 
+            self.temp_dir_entry, self.output_dir_entry, self.output_dir_button,
+            self.correction_threshold_entry, self.overlap_tolerance_entry,
             self.truncation_threshold_entry, self.workers_entry, self.rpm_entry, 
             self.custom_endpoint_check, self.base_url_entry,
             self.report_check, self.keep_prompt_check, self.start_button, 
@@ -723,7 +746,7 @@ class TranscriptionApp:
         # --- END NEW ---
 
     def _bind_settings_changes(self):
-        for var in [self.api_key_var, self.model_name_var, self.use_custom_endpoint_var, self.custom_base_url_var, self.chunk_duration_var, self.temp_dir_var, self.correction_threshold_var, self.overlap_tolerance_var, self.truncation_threshold_var, self.language_var, self.max_chars_var, self.enable_report_var, self.keep_prompt_var, self.keep_partial_audio_var, self.workers_var, self.rpm_var, self.empty_abort_threshold_var]:
+        for var in [self.api_key_var, self.model_name_var, self.use_custom_endpoint_var, self.custom_base_url_var, self.chunk_duration_var, self.temp_dir_var, self.output_dir_var, self.correction_threshold_var, self.overlap_tolerance_var, self.truncation_threshold_var, self.language_var, self.max_chars_var, self.enable_report_var, self.keep_prompt_var, self.keep_partial_audio_var, self.workers_var, self.rpm_var, self.empty_abort_threshold_var]:
             var.trace_add("write", self._set_settings_changed)
         self.main_rules_text.bind("<<Modified>>", self._on_text_modified)
 
@@ -817,6 +840,8 @@ class TranscriptionApp:
         config.custom_base_url = (self.custom_base_url_var.get().strip()
                                   if self.use_custom_endpoint_var.get() else None)
         config.chunk_duration = int(self.chunk_duration_var.get()); config.temp_dir = os.path.normpath(self.temp_dir_var.get())
+        output_dir = self.output_dir_var.get().strip()
+        config.output_dir = os.path.normpath(output_dir) if output_dir else None
         config.ffmpeg_path = os.path.normpath(self.ffmpeg_path); config.correction_threshold = int(self.correction_threshold_var.get())
         config.overlap_tolerance = float(self.overlap_tolerance_var.get()); config.truncation_threshold = int(self.truncation_threshold_var.get())
         config.workers = int(self.workers_var.get()); config.rpm = int(self.rpm_var.get())
@@ -904,7 +929,7 @@ class TranscriptionApp:
         else:
             resume_action = "new_task" if merge_only else self._check_for_resume()
             if resume_action == "cancel": self.status_var.set("狀態: 操作已取消。"); return
-            self._set_ui_state(tk.DISABLED); self.is_running = True; self.status_var.set("狀態：執行中...請稍候...")
+            self._set_ui_state(tk.DISABLED); self.is_running = True; self.status_var.set("狀態：任務啟動中...")
             # 使用後端腳本的日誌格式
             # self.log(f"\n{'='*60}\n【{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}】開始新任務\n{'='*60}")
             config = self._build_config_object(resume=(resume_action == "resume"), recreate=(resume_action == "recreate"), merge_only=merge_only)
@@ -930,6 +955,7 @@ class TranscriptionApp:
             target_func = backend_task.run_summarize_only_task if is_summary_task else (backend_task.run_partial_transcription_task if is_partial_task else backend_task.run_transcription_task)
             self.process = multiprocessing.Process(target=process_wrapper, args=(target_func, config, self.log_queue))
             self.process.start()
+            self.status_var.set("狀態：任務啟動中...")
             threading.Thread(target=self._wait_for_process, daemon=True).start()
         except Exception as e:
             self.log(f"\n!!! 啟動背景任務失敗 !!!\n{e}\n"); self.is_running = False; self._set_ui_state(tk.NORMAL)
@@ -948,6 +974,9 @@ class TranscriptionApp:
                 if isinstance(item, str):
                     line = item.rstrip()
                     if "INFO -" in line and "發送轉錄請求" in line: self.transcription_actually_performed = True
+                    if "[STATUS]" in line:
+                        status_text = line.split("[STATUS]", 1)[1].strip()
+                        self.status_var.set(f"狀態：{status_text}")
                     if line.startswith("[RETRY_REPORT]"):
                         log_filepath = line.replace("[RETRY_REPORT]", "").strip()
                         self.is_running = False; self._set_ui_state(tk.NORMAL)
@@ -978,6 +1007,7 @@ class TranscriptionApp:
             self.main_rules_text.unbind("<<Modified>>")
             self.api_key_var.set(data.get("api_key", "")); self.model_name_var.set(data.get("model_name", "models/gemini-2.5-pro")); self.chunk_duration_var.set(data.get("chunk_duration", "600"))
             self.use_custom_endpoint_var.set(data.get("use_custom_endpoint", False)); self.custom_base_url_var.set(data.get("custom_base_url", ""))
+            self.output_dir_var.set(data.get("output_dir", ""))
             self.temp_dir_var.set(data.get("temp_dir", os.path.join(APP_PATH, "temp"))); self.correction_threshold_var.set(data.get("correction_threshold", "5")); self.overlap_tolerance_var.set(data.get("overlap_tolerance", "0.5"))
             self.truncation_threshold_var.set(data.get("truncation_threshold", "60")); self.workers_var.set(data.get("workers", "1")); self.rpm_var.set(data.get("rpm", "3"))
             self.empty_abort_threshold_var.set(data.get("empty_abort_threshold", "5")); self.language_var.set(data.get("language", "繁體中文")); self.max_chars_var.set(data.get("max_chars", "15"))
@@ -1003,6 +1033,7 @@ class TranscriptionApp:
             "custom_base_url": self.custom_base_url_var.get(),
             "chunk_duration": self.chunk_duration_var.get(),
             "temp_dir": self.temp_dir_var.get(),
+            "output_dir": self.output_dir_var.get(),
             "correction_threshold": self.correction_threshold_var.get(),
             "overlap_tolerance": self.overlap_tolerance_var.get(),
             "truncation_threshold": self.truncation_threshold_var.get(),
@@ -1088,6 +1119,7 @@ class TranscriptionApp:
                 self.main_rules_text.unbind("<<Modified>>")
                 self.api_key_var.set(data.get("api_key", "")); self.model_name_var.set(data.get("model_name", "models/gemini-2.5-pro")); self.chunk_duration_var.set(data.get("chunk_duration", "600"))
                 self.use_custom_endpoint_var.set(data.get("use_custom_endpoint", False)); self.custom_base_url_var.set(data.get("custom_base_url", ""))
+                self.output_dir_var.set(data.get("output_dir", ""))
                 self.temp_dir_var.set(data.get("temp_dir", os.path.join(APP_PATH, "temp"))); self.correction_threshold_var.set(data.get("correction_threshold", "5")); self.overlap_tolerance_var.set(data.get("overlap_tolerance", "0.5"))
                 self.truncation_threshold_var.set(data.get("truncation_threshold", "60")); self.workers_var.set(data.get("workers", "1")); self.rpm_var.set(data.get("rpm", "3"))
                 self.empty_abort_threshold_var.set(data.get("empty_abort_threshold", "5")); self.language_var.set(data.get("language", "繁體中文")); self.max_chars_var.set(data.get("max_chars", "15"))
