@@ -8,6 +8,7 @@
 # 5.  【完整性】: 此版本為包含所有函式與常數定義的完整版本，解決先前因省略程式碼導致的 Pylance 錯誤。
 # 6. 新增工具箱：快速知道這個時間點的原始音訊是來自哪個編號分割檔案的小計算機，預設自動代入下方分割時間段秒數，可手動修改
 # 7. 【輸出與退出修正】: 新增輸出目錄設定、即時狀態顯示，並強制子程序退出以避免報告生成後 GUI 卡死。
+# 8. v2.85.1 修正視窗高度溢出裁切 + 參數標籤截斷。
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox, simpledialog
 from tkinter import font as tkfont
@@ -24,7 +25,7 @@ import multiprocessing
 from types import SimpleNamespace
 
 # 匯入重構後的後端任務模組 (請確保此檔案與主程式位於同一目錄)
-import transcribe_pro_v5_branch_04_branch_70 as backend_task
+import transcribe_pro_v6 as backend_task
 
 # ==============================================================================
 #  Process Wrapper
@@ -152,7 +153,7 @@ APP_PATH = get_application_path()
 # ==============================================================================
 #  全域設定與常數
 # ==============================================================================
-CORE_SCRIPT_NAME = "transcribe_pro_v5_branch_04_branch_70.py"
+CORE_SCRIPT_NAME = "transcribe_pro_v6.py"
 CONFIG_FILE = os.path.join(APP_PATH, "config.json")
 GENDER_OPTIONS = ["未指定", "男", "女"]
 
@@ -335,6 +336,7 @@ class TranscriptionApp:
         self._check_dependencies()
         self.master.title(f"AI 字幕轉錄工具 v2.84 (核心: {CORE_SCRIPT_NAME})")
         self.master.geometry("960x900")
+        self.master.minsize(820, 600)
         self.start_time_entries = {}
         self.end_time_entries = {}
         self.is_running = False
@@ -438,8 +440,41 @@ class TranscriptionApp:
     # --- END NEW ---
     
     def _create_widgets(self):
-        main_frame = ttk.Frame(self.master, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        # --- 滾動容器外殼：避免內容超出窗口高度時底部控件被裁切 ---
+        outer = ttk.Frame(self.master)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        self._main_canvas = tk.Canvas(outer, highlightthickness=0)
+        vscroll = ttk.Scrollbar(outer, orient="vertical", command=self._main_canvas.yview)
+        self._main_canvas.configure(yscrollcommand=vscroll.set)
+
+        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._main_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        main_frame = ttk.Frame(self._main_canvas, padding="10")
+        self._main_canvas_window = self._main_canvas.create_window((0, 0), window=main_frame, anchor="nw")
+
+        # 內容尺寸變化時更新滾動區域
+        def _on_content_configure(event):
+            self._main_canvas.configure(scrollregion=self._main_canvas.bbox("all"))
+        main_frame.bind("<Configure>", _on_content_configure)
+
+        # 畫布寬度變化時，讓內容幀寬度跟隨畫布，避免橫向留白
+        def _on_canvas_configure(event):
+            self._main_canvas.itemconfigure(self._main_canvas_window, width=event.width)
+        self._main_canvas.bind("<Configure>", _on_canvas_configure)
+
+        # 鼠標滾輪（Windows / macOS：<MouseWheel>；Linux：Button-4/5）
+        def _on_mousewheel(event):
+            if event.num == 4:
+                self._main_canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                self._main_canvas.yview_scroll(1, "units")
+            else:
+                self._main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._main_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self._main_canvas.bind_all("<Button-4>", _on_mousewheel)
+        self._main_canvas.bind_all("<Button-5>", _on_mousewheel)
         
         # --- 1. 選擇來源檔案 (Corrected Layout) ---
         file_frame = ttk.LabelFrame(main_frame, text=" 1. 選擇來源檔案 ", padding="10")
@@ -589,7 +624,11 @@ class TranscriptionApp:
         # --- 4. 執行參數設定 ---
         params_frame = ttk.LabelFrame(main_frame, text=" 3. 執行參數設定 ", padding="10")
         params_frame.pack(fill=tk.X, padx=5, pady=5)
-        for i in range(6): params_frame.columnconfigure(i, weight=1)
+        # 標籤列固定不擠壓，輸入框列吸收彈性寬度
+        for col in (0, 2, 4):
+            params_frame.columnconfigure(col, weight=0, minsize=140)
+        for col in (1, 3, 5):
+            params_frame.columnconfigure(col, weight=1, minsize=80)
 
         self.api_key_var = tk.StringVar(); self.model_name_var = tk.StringVar(value="models/gemini-2.5-pro")
         self.temp_dir_var = tk.StringVar(value=os.path.join(APP_PATH, "temp")); self.output_dir_var = tk.StringVar(); self.correction_threshold_var = tk.StringVar(value="6"); self.overlap_tolerance_var = tk.StringVar(value="0.5")
