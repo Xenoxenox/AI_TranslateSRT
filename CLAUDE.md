@@ -32,7 +32,7 @@ python transcribe_pro_v6.py --file 影片.mp4 --api_key KEY \
 - 四個任務入口（由 config 旗標選擇，見 `_run_process`）：完整轉錄 `run_transcription_task`、局部轉錄 `run_partial_transcription_task`、僅摘要 `run_summarize_only_task`、僅合併（`run_transcription_task` 內的 `merge_only` 分支）。
 - GUI worker 會在 queue flush 後用 `os._exit()` 強制退出，避免 genai/grpc 背景執行緒讓父程序 `join()` 永久等待。
 - `config.json` 在程式關閉時自動寫入 `APP_PATH`，**內含介面上的 API Key**（明碼），啟動時自動載入。改動設定欄位時記得呼叫 `_set_settings_changed`。
-- 目前已知 GUI 佈局問題：smoke test 證據提交 `7b9cf3f` 顯示最大化與還原視窗時「即時日誌」等區域可能被遮擋；這是後續 layout/style 修正，不屬於 v2.1.0 endpoint 分支阻塞項。
+- GUI 佈局修正已在 `feat/gui-layout-fix` 收斂：主介面內容包進 Canvas 垂直滾動容器，視窗最小尺寸為 820x600，參數區標籤列固定寬度避免截斷，窗口標題同步為 v2.85.1。smoke 證據在孤立分支 `evidence/gui-layout-fix-smoke` 的 `78dc492`，開發提交 `094659c` 帶有對應 Git note。
 
 ### 後端 `transcribe_pro_v6.py`
 轉錄管線：`split_audio`（FFmpeg 依 `chunk_duration` 切段）→ 各段呼叫 `transcribe_audio`（Gemini API）→ `format_srt_from_text_v16` 解析校正 → `merge_srts` 合併 → 選擇性 `create_transcription_report`（AI 摘要）。
