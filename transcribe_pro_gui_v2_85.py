@@ -334,7 +334,7 @@ class TranscriptionApp:
         self.ffmpeg_path = None
         self.is_closing = False
         self._check_dependencies()
-        self.master.title(f"AI 字幕轉錄工具 v2.84 (核心: {CORE_SCRIPT_NAME})")
+        self.master.title(f"AI 字幕轉錄工具 v2.85.1 (核心: {CORE_SCRIPT_NAME})")
         self.master.geometry("960x900")
         self.master.minsize(820, 600)
         self.start_time_entries = {}
