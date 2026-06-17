@@ -27,6 +27,7 @@ test/
 temp/
 config.json
 logs/
+build_log.txt
 
 # Gitkeep
 !logs/.gitkeep
