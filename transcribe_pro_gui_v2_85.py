@@ -610,6 +610,9 @@ class TranscriptionApp:
 
         # 鼠標滾輪（Windows / macOS：<MouseWheel>；Linux：Button-4/5）
         def _on_mousewheel(event):
+            # 鼠標懸停在內層可滾動文字框上時，放行給該組件自身處理，避免外層 Canvas 劫持滾輪
+            if isinstance(event.widget, tk.Text):
+                return
             if event.num == 4:
                 self._main_canvas.yview_scroll(-1, "units")
             elif event.num == 5:
