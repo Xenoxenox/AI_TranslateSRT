@@ -454,6 +454,9 @@ def transcribe_audio(client, audio_path, prompt_text, model_name,
             if not is_final_srt_valid(corrected_srt):
                 raise ValueError("校正後的 SRT 檔案結構驗證失敗 (序列號與時間戳數量不匹配)，觸發重試。")
 
+            if "Unicode U+3040-U+30FF" in prompt_text and re.search(r'[\u3040-\u30ff]', corrected_srt):
+                raise ValueError("輸出含日文假名，違反翻譯場景語言要求，觸發重試。")
+
             if corrected_srt and truncation_threshold > 0:
                 effective_duration_td = timedelta(seconds=chunk_duration)
                 duration_source_msg = f"標準分段時長 {chunk_duration}s"
